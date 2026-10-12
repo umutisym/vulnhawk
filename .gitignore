@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Raporlar
+rapor_*.txt
+report_*.txt
+
+# Editörler
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# Test
+test_*.py
