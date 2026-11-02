@@ -1,0 +1,491 @@
+"""
+VulnHawk - Focused Vulnerability Scanner
+Hedefli Zafiyet Tarayıcı
+
+Author: Umut (@umutisym)
+License: MIT
+"""
+
+import socket
+import subprocess
+import sys
+import os
+import re
+import time
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+
+
+# ============================
+# AYARLAR / SETTINGS
+# ============================
+
+VERSION = "1.0.0"
+TIMEOUT = 1              # Port başına bekleme süresi (saniye)
+MAX_THREAD = 100         # Aynı anda çalışacak thread sayısı
+NMAP_TIMEOUT = 120       # Nmap için toplam süre (saniye)
+RAPOR_KLASORU = "raporlar"   # Raporların kaydedileceği klasör
+
+
+# Taranacak yaygın portlar
+YAYGIN_PORTLAR = [
+    21,    # FTP
+    22,    # SSH
+    23,    # Telnet
+    25,    # SMTP
+    53,    # DNS
+    80,    # HTTP
+    110,   # POP3
+    135,   # RPC
+    139,   # NetBIOS
+    143,   # IMAP
+    443,   # HTTPS
+    445,   # SMB
+    993,   # IMAPS
+    995,   # POP3S
+    1433,  # MSSQL
+    1521,  # Oracle
+    3306,  # MySQL
+    3389,  # RDP
+    5432,  # PostgreSQL
+    5900,  # VNC
+    6379,  # Redis
+    8080,  # HTTP Proxy
+    8443,  # HTTPS Alt
+    27017, # MongoDB
+]
+
+
+# ============================
+# CVE VERİTABANI / CVE DATABASE
+# ============================
+
+CVE_VERITABANI = {
+    "vsftpd": {
+        "2.3.4": ("CVE-2011-2523", "Backdoor / Arka kapı"),
+    },
+    "apache": {
+        "2.4.49": ("CVE-2021-41773", "Path Traversal"),
+        "2.4.50": ("CVE-2021-42013", "Path Traversal (bypass)"),
+    },
+    "openssh": {
+        "7.4": ("CVE-2016-10708", "Denial of Service"),
+        "8.5": ("CVE-2021-41617", "Privilege Escalation"),
+    },
+    "redis": {
+        "5.0.0": ("CVE-2021-32675", "Denial of Service"),
+    },
+    "nginx": {
+        "1.20.0": ("CVE-2021-23017", "DNS Resolver Vulnerability"),
+    },
+    "samba": {
+        "3.0.20": ("CVE-2007-2447", "Remote Code Execution"),
+    },
+    "proftpd": {
+        "1.3.5": ("CVE-2015-3306", "Remote Code Execution"),
+    },
+}
+
+
+# ============================
+# YARDIMCI FONKSİYONLAR / HELPERS
+# ============================
+
+def _host_al():
+    """Kullanıcıdan geçerli bir host alır. Menüye dönüşte None döner."""
+    while True:
+        host = input("Hedef host (IP veya domain) [q=menüye dön]: ").strip()
+
+        if host.lower() in ("q", "quit", "exit", "0"):
+            print("[*] Menüye dönülüyor...")
+            time.sleep(0.8)
+            return None
+
+        if not host:
+            print("[!] Boş giriş. Tekrar deneyin.")
+            continue
+
+        try:
+            socket.gethostbyname(host)
+            return host
+        except socket.gaierror:
+            print("[!] Host çözümlenemedi. Tekrar deneyin.")
+
+
+def _tek_port_tara(ip, port, timeout=TIMEOUT):
+    """Tek bir portu kontrol eder. Açıksa True döner."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            return s.connect_ex((ip, port)) == 0
+    except OSError:
+        return False
+
+
+def _portlari_tara(ip, portlar, max_thread=MAX_THREAD):
+    """Verilen port listesini paralel tarar, açık olanları sıralı döner."""
+    def _kontrol(port):
+        return port if _tek_port_tara(ip, port) else None
+
+    acik = []
+    with ThreadPoolExecutor(max_workers=max_thread) as executor:
+        for sonuc in executor.map(_kontrol, portlar):
+            if sonuc is not None:
+                acik.append(sonuc)
+    return sorted(acik)
+
+
+def banner_al(ip, port, timeout=2.0):
+    """Servis banner'ını (versiyon bilgisi) toplamaya çalışır."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect((ip, port))
+
+            if port in (80, 8080):
+                s.sendall(b"HEAD / HTTP/1.0\r\nHost: %b\r\n\r\n" % ip.encode())
+
+            try:
+                veri = s.recv(2048)
+                return veri.decode("utf-8", errors="ignore").strip()
+            except socket.timeout:
+                return ""
+    except (OSError, socket.gaierror):
+        return ""
+
+
+def cve_eslestir(banner):
+    """Banner içindeki servis+versiyon bilgisini CVE veritabanıyla eşler."""
+    if not banner:
+        return []
+
+    sonuclar = []
+    b = banner.lower()
+
+    for servis, versiyonlar in CVE_VERITABANI.items():
+        if servis not in b:
+            continue
+        for m in re.finditer(r"\b(\d+\.\d+(?:\.\d+)?)\b", banner):
+            ver = m.group(1)
+            if ver in versiyonlar:
+                cve, aciklama = versiyonlar[ver]
+                sonuclar.append((servis, ver, cve, aciklama))
+
+    return sorted(set(sonuclar))
+
+
+def nmap_servis_tespiti(ip):
+    """Nmap kuruluysa servis/versiyon tespiti yapar. Yoksa None."""
+    try:
+        sonuc = subprocess.run(
+            ["nmap", "-sV", "-Pn", "--top-ports", "50", "-T4", ip],
+            capture_output=True, text=True, timeout=NMAP_TIMEOUT,
+        )
+        return sonuc.stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
+# ============================
+# RAPOR / REPORT
+# ============================
+
+def _rapor_yaz(host, ip, acik_portlar, bulgular=None, ekstra=None):
+    """Raporu 'raporlar/' klasörüne .txt olarak kaydeder.
+    Kaydedilen dosyanın TAM yolunu döner."""
+    # 1) Klasör yoksa oluştur
+    os.makedirs(RAPOR_KLASORU, exist_ok=True)
+
+    # 2) Dosya adını oluştur
+    zaman = datetime.now().strftime("%Y%m%d_%H%M%S")
+    guvenli_host = "".join(c if c.isalnum() or c in ".-" else "_" for c in host)
+    dosya_adi = f"vulnhawk_rapor_{guvenli_host}_{zaman}.txt"
+    tam_yol = os.path.join(RAPOR_KLASORU, dosya_adi)
+
+    # 3) Yaz
+    with open(tam_yol, "w", encoding="utf-8") as f:
+        f.write("=" * 55 + "\n")
+        f.write(f"  VULNHAWK v{VERSION} - TARAMA RAPORU\n")
+        f.write("=" * 55 + "\n")
+        f.write(f"Hedef       : {host}\n")
+        f.write(f"IP Adresi   : {ip}\n")
+        f.write(f"Tarih       : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Açık Port   : {len(acik_portlar)}\n")
+        f.write("-" * 55 + "\n")
+
+        if acik_portlar:
+            f.write("Açık Portlar:\n")
+            for p in acik_portlar:
+                f.write(f"  - {p}/tcp\n")
+        else:
+            f.write("Açık port bulunamadı.\n")
+
+        if bulgular:
+            f.write("-" * 55 + "\n")
+            f.write(f"Bilinen Zafiyet Eşleşmeleri ({len(bulgular)}):\n")
+            for port, (servis, ver, cve, aciklama) in bulgular:
+                f.write(f"  [{port}] {servis} {ver} -> {cve}: {aciklama}\n")
+
+        if ekstra:
+            f.write("-" * 55 + "\n")
+            f.write("Ek Bilgi:\n")
+            f.write(ekstra + "\n")
+
+        f.write("=" * 55 + "\n")
+
+    # 4) Tam yolu döndür
+    return os.path.abspath(tam_yol)
+
+
+def _raporu_ac(dosya):
+    """Raporu işletim sisteminin varsayılan metin editöründe açar."""
+    try:
+        if sys.platform == "win32":
+            os.startfile(dosya)                      # Windows
+        elif sys.platform == "darwin":
+            subprocess.run(["open", dosya])          # macOS
+        else:
+            subprocess.run(["xdg-open", dosya])      # Linux
+        return True
+    except Exception:
+        return False
+
+
+def _rapor_sonrasi_secim(host, ip, acik, bulgular=None, ekstra=None):
+    """Rapor oluştur, ekranda tam yolu göster, isteğe bağlı aç."""
+    dosya = _rapor_yaz(host, ip, acik, bulgular=bulgular, ekstra=ekstra)
+    print(f"\n[+] Rapor kaydedildi:")
+    print(f"    📁 {dosya}")
+
+    acilsin = input("Raporu şimdi açmak ister misiniz? (e/h): ").strip().lower()
+    if acilsin in ("e", "evet", "y", "yes"):
+        if _raporu_ac(dosya):
+            print("[+] Rapor açıldı.")
+        else:
+            print("[i] Rapor otomatik açılamadı, elle açabilirsiniz.")
+
+
+# ============================
+# PORT KONTROLÜ / PORT CHECK
+# ============================
+
+def _port_tara():
+    """Kullanıcıdan host alır, yaygın portları tarar.
+    Tarama sonrası menü / rapor / çıkış seçimi sunar."""
+    host = _host_al()
+    if host is None:
+        return None
+
+    ip = socket.gethostbyname(host)
+    print(f"[*] {host} ({ip}) çözümlendi.")
+    print(f"[*] {len(YAYGIN_PORTLAR)} port taranıyor (thread={MAX_THREAD})...")
+
+    baslangic = time.time()
+    acik = _portlari_tara(ip, YAYGIN_PORTLAR)
+    sure = time.time() - baslangic
+
+    print(f"\n[*] Tarama {sure:.2f} saniyede tamamlandı.")
+    if acik:
+        print(f"[+] Açık portlar ({len(acik)}):")
+        for p in acik:
+            print(f"    - {p}/tcp")
+    else:
+        print("[-] Açık port bulunamadı.")
+
+    # === Tarama sonrası seçim döngüsü ===
+    while True:
+        print("\n" + "-" * 50)
+        print("Şimdi ne yapmak istersiniz?")
+        print("  1) Menüye dön")
+        print("  2) Rapor oluştur (dosyaya yaz)")
+        print("  3) Çıkış")
+        print("-" * 50)
+        secim = input("Seçim: ").strip()
+
+        if secim == "1":
+            print("[*] Menüye dönülüyor...")
+            time.sleep(0.5)
+            return acik
+
+        elif secim == "2":
+            _rapor_sonrasi_secim(host, ip, acik)
+            print("[*] Menüye dönülüyor...")
+            time.sleep(0.8)
+            return acik
+
+        elif secim == "3":
+            print("[*] Çıkılıyor...")
+            sys.exit(0)
+
+        else:
+            print("[!] Geçersiz seçim. 1, 2 veya 3 girin.")
+
+
+# ============================
+# AÇIK ZAFİYET TARAMASI
+# ============================
+
+def hizli_zafiyet_taramasi():
+    """Port tarama + banner toplama + CVE eşleştirme."""
+    host = _host_al()
+    if host is None:
+        return
+
+    ip = socket.gethostbyname(host)
+    print(f"\n[*] {host} ({ip}) üzerinde hızlı zafiyet taraması başladı.")
+    print("[*] Adım 1/3: Port taraması...")
+
+    acik = _portlari_tara(ip, YAYGIN_PORTLAR)
+    if not acik:
+        print("[-] Açık port yok, tarama sonlanıyor.")
+        return
+
+    print(f"[+] {len(acik)} açık port: {acik}")
+
+    print("\n[*] Adım 2/3: Banner toplama...")
+    bulgular = []
+    for port in acik:
+        banner = banner_al(ip, port)
+        if banner:
+            kisa = banner.splitlines()[0][:100]
+            print(f"    [{port}] {kisa}")
+            for eslesme in cve_eslestir(banner):
+                bulgular.append((port, eslesme))
+        else:
+            print(f"    [{port}] banner alınamadı")
+
+    print("\n[*] Adım 3/3: Nmap ile ek servis tespiti (opsiyonel)...")
+    nmap_cikti = nmap_servis_tespiti(ip)
+    if nmap_cikti:
+        print("[+] Nmap çıktısı:")
+        print("-" * 50)
+        print(nmap_cikti)
+        print("-" * 50)
+    else:
+        print("[i] Nmap bulunamadı veya zaman aşımı; atlanıyor.")
+
+    # === Rapor ===
+    print("\n" + "=" * 50)
+    print("🦅 TARAMA RAPORU")
+    print("=" * 50)
+    print(f"Hedef      : {host} ({ip})")
+    print(f"Tarih      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Açık port  : {len(acik)} -> {acik}")
+
+    if bulgular:
+        print(f"\n🚨 Bilinen zafiyet eşleşmeleri ({len(bulgular)}):")
+        for port, (servis, ver, cve, aciklama) in bulgular:
+            print(f"    [{port}] {servis} {ver} -> {cve}: {aciklama}")
+    else:
+        print("\n[i] Banner'larda bilinen bir CVE eşleşmesi bulunamadı.")
+    print("=" * 50)
+
+    # === Tarama sonrası seçim döngüsü ===
+    while True:
+        print("\n" + "-" * 50)
+        print("Şimdi ne yapmak istersiniz?")
+        print("  1) Menüye dön")
+        print("  2) Rapor oluştur (dosyaya yaz)")
+        print("  3) Çıkış")
+        print("-" * 50)
+        secim = input("Seçim: ").strip()
+
+        if secim == "1":
+            print("[*] Menüye dönülüyor...")
+            time.sleep(0.5)
+            return
+
+        elif secim == "2":
+            _rapor_sonrasi_secim(host, ip, acik, bulgular=bulgular, ekstra=nmap_cikti)
+            print("[*] Menüye dönülüyor...")
+            time.sleep(0.8)
+            return
+
+        elif secim == "3":
+            print("[*] Çıkılıyor...")
+            sys.exit(0)
+
+        else:
+            print("[!] Geçersiz seçim. 1, 2 veya 3 girin.")
+
+
+# ============================
+# BELİRLİ PORT TARAMASI
+# ============================
+
+def belirli_port_tara():
+    """Kullanıcının seçtiği tek bir portu tarar."""
+    host = _host_al()
+    if host is None:
+        return
+
+    port_str = input("Port numarası (1-65535) [q=menüye dön]: ").strip()
+    if port_str.lower() in ("q", "quit", "exit", "0"):
+        return
+
+    try:
+        port = int(port_str)
+        if not 1 <= port <= 65535:
+            raise ValueError
+    except ValueError:
+        print("[!] Geçersiz port numarası.")
+        return
+
+    ip = socket.gethostbyname(host)
+    print(f"[*] {ip}:{port} taranıyor...")
+
+    if not _tek_port_tara(ip, port, timeout=2.0):
+        print(f"[-] {port}/tcp kapalı.")
+        return
+
+    print(f"[+] {port}/tcp AÇIK")
+    banner = banner_al(ip, port)
+    if banner:
+        print(f"[Banner] {banner[:300]}")
+        eslesmeler = cve_eslestir(banner)
+        if eslesmeler:
+            for servis, ver, cve, aciklama in eslesmeler:
+                print(f"🚨 {servis} {ver} -> {cve}: {aciklama}")
+        else:
+            print("[i] Bilinen CVE eşleşmesi yok.")
+    else:
+        print("[i] Banner alınamadı.")
+
+
+# ============================
+# ANA PROGRAM / MAIN
+# ============================
+
+def menu():
+    print("=" * 50)
+    print(f"   🦅 VULNHAWK v{VERSION}")
+    print("   Hedefli Zafiyet Tarayıcı")
+    print("=" * 50)
+    print("Yapabileceğiniz işlemler:")
+    print("  1) Hızlı Port Taraması")
+    print("  2) Açık Zafiyet Taraması")
+    print("  3) Sadece Belirtilen Portu Tara")
+    print("  (Çıkmak için 0 veya q)")
+    print("=" * 50)
+    return input("Yapılacak işlemi seçiniz: ").strip()
+
+
+if __name__ == "__main__":
+    try:
+        while True:
+            secim = menu()
+
+            if secim.lower() in ("q", "quit", "exit", "0"):
+                print("Çıkılıyor...")
+                break
+            elif secim == "1":
+                _port_tara()
+            elif secim == "2":
+                hizli_zafiyet_taramasi()
+            elif secim == "3":
+                belirli_port_tara()
+            else:
+                print("[!] Geçersiz seçim, tekrar deneyin.")
+    except KeyboardInterrupt:
+        print("\n[!] Ctrl+C algılandı, çıkılıyor.")
+        sys.exit(0)
